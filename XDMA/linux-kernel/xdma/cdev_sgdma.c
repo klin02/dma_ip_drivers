@@ -320,8 +320,14 @@ static int char_sgdma_close(struct inode *inode, struct file *filp)
 		return rv;
 
 	engine = xcdev->engine;
-	
-	clear_bit_unlock(XENGINE_OPEN_BIT, &(engine->flags));
+
+	/* Recover a BUSY bit left behind when a transfer exited abnormally. */
+	if (test_bit(XENGINE_BUSY_BIT, &engine->flags)) {
+		clear_bit_unlock(XENGINE_BUSY_BIT, &engine->flags);
+		pr_warn("engine %s: BUSY_BIT was still set at close, force-cleared\n", engine->name);
+	}
+
+	clear_bit_unlock(XENGINE_OPEN_BIT, &engine->flags);
 	return 0;
 }
 static const struct file_operations sgdma_fops = {

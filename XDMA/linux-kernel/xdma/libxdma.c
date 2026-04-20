@@ -2582,6 +2582,7 @@ static void wait_for_engines_idle(struct xdma_dev *xdev)
 {
 	struct xdma_engine *engine; 
 	unsigned int i;
+	unsigned long deadline;
 	/*it is best just to wait for engines to finish "naturally" their current transfer,
 	but still break indefinite waits*/
 	for (i = 0; i < xdev->h2c_channel_num; i++) {
@@ -2593,8 +2594,17 @@ static void wait_for_engines_idle(struct xdma_dev *xdev)
 			complete_all( &(engine->engine_compl));
 #endif	
 /*polling is perhaps not the best way to wait, however there should be very rarely a need for that.
-It should break immediately in normal operation, therefore acceptable.*/ 
-			while(test_bit(XENGINE_BUSY_BIT, &(engine->flags)));
+It should break immediately in normal operation, therefore acceptable.
+Use a timeout to avoid infinite hang if BUSY_BIT is stuck due to abnormal exit.*/
+			deadline = jiffies + msecs_to_jiffies(h2c_timeout_ms ? h2c_timeout_ms : 10000);
+			while(test_bit(XENGINE_BUSY_BIT, &(engine->flags))) {
+				if (time_after(jiffies, deadline)) {
+					pr_warn("engine %s: BUSY_BIT stuck, forcing clear\n", engine->name);
+					clear_bit_unlock(XENGINE_BUSY_BIT, &(engine->flags));
+					break;
+				}
+				cpu_relax();
+			}
 						
 		}
 	}
@@ -2606,7 +2616,15 @@ It should break immediately in normal operation, therefore acceptable.*/
 #ifndef XDMA_POLL_MODE
 			complete_all( &(engine->engine_compl));
 #endif	
-			while(test_bit(XENGINE_BUSY_BIT, &(engine->flags)));
+			deadline = jiffies + msecs_to_jiffies(c2h_timeout_ms ? c2h_timeout_ms : 10000);
+			while(test_bit(XENGINE_BUSY_BIT, &(engine->flags))) {
+				if (time_after(jiffies, deadline)) {
+					pr_warn("engine %s: BUSY_BIT stuck, forcing clear\n", engine->name);
+					clear_bit_unlock(XENGINE_BUSY_BIT, &(engine->flags));
+					break;
+				}
+				cpu_relax();
+			}
 						
 		}
 	}
