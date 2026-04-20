@@ -45,7 +45,8 @@ MODULE_LICENSE("Dual BSD/GPL");
 static int xpdev_cnt;
 
 static const struct pci_device_id pci_ids[] = {
-	
+
+	{ PCI_DEVICE(0x10ee, 0x9048), },
 	{ PCI_DEVICE(0x10ee, 0x8034), },
 #if defined (XDMA_VENDOR_ID) && defined (XDMA_DEVICE_ID)
 	{ PCI_DEVICE(XDMA_VENDOR_ID, XDMA_DEVICE_ID), },

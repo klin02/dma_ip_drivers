@@ -24,7 +24,7 @@ SHELL = /bin/bash
 # - config_bar_num=,	xdma pci config bar number
 # - xvc_bar_num=,	xvc pci bar #
 # - xvc_bar_offset=,	xvc register base offset
-# 
+#
 ifneq ($(xvc_bar_num),)
 	XVC_FLAGS += -D__XVC_BAR_NUM__=$(xvc_bar_num)
 endif
@@ -56,6 +56,7 @@ endif
 ifneq ($(c2h_timeout),)
 	EXTRA_CFLAGS += -DXDMA_C2H_TIMEOUT=$(c2h_timeout)
 endif
+POLLING ?= 1
 ifeq ($(POLLING),1)
 	EXTRA_CFLAGS += -DXDMA_POLL_MODE
 endif
@@ -78,7 +79,7 @@ endif
 #EXTRA_CFLAGS += -DINTERNAL_TESTING
 
 ifneq ($(KERNELRELEASE),)
-	$(TARGET_MODULE)-objs := libxdma.o xdma_cdev.o cdev_ctrl.o cdev_events.o cdev_sgdma.o cdev_xvc.o cdev_bypass.o xdma_mod.o 
+	$(TARGET_MODULE)-objs := libxdma.o xdma_cdev.o cdev_ctrl.o cdev_events.o cdev_sgdma.o cdev_xvc.o cdev_bypass.o xdma_mod.o
 	obj-m := $(TARGET_MODULE).o
 else
 	MODLIB:=/lib/modules/$(shell uname -r)
