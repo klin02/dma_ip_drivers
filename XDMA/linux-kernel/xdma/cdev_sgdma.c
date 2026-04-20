@@ -336,7 +336,12 @@ static int char_sgdma_close(struct inode *inode, struct file *filp)
 		return rv;
 
 	engine = xcdev->engine;
-	
+
+	/* Safety: clear BUSY_BIT in case of abnormal exit (e.g. kernel oops
+	 * during xdma_xfer_submit prevented normal clear in read_write path) */
+	if (test_and_clear_bit(XENGINE_BUSY_BIT, &(engine->flags)))
+		pr_warn("engine %s: BUSY_BIT was still set at close, force-cleared\n", engine->name);
+
 	clear_bit(XENGINE_OPEN_BIT, &(engine->flags));
 	smp_mb__after_atomic();
 	return 0;
