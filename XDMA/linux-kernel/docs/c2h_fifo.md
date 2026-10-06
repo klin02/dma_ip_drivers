@@ -10,19 +10,35 @@ not register buffers or report how many user buffers they allocate.
 Build with `POLLING=1`. With the device idle, load the module with:
 
 ```sh
-sudo insmod ./xdma-chr.ko c2h_fifo_slots=256 c2h_fifo_credit_batch=32
+packet_bytes=1024
+fifo_slots=128
+sudo insmod ./xdma-chr.ko c2h_fifo_frame_bytes="$packet_bytes" \
+  c2h_fifo_slots="$fifo_slots"
 ```
 
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
 | `c2h_fifo_slots` | 0 | Disabled at 0; enabled ring capacity is 2..512 packets |
-| `c2h_fifo_frame_bytes` | 768 | Fixed packet length, 64..65536 bytes, multiple of 64 |
-| `c2h_fifo_credit_batch` | 32 | Return credits after 1..slots packets are consumed |
+| `c2h_fifo_frame_bytes` | 0 | Required when enabled: packet length, 64..65536 bytes, multiple of 64 |
+| `c2h_fifo_credit_batch` | 0 | Auto selects min(32, slots); an explicit value must be 1..slots |
 
-The parameters are read-only after module load. For an 8-slot ring, also set
-`c2h_fifo_credit_batch=8`. A 256-slot, 768-byte ring allocates 192 KiB of
-payload storage and 8 KiB of descriptors per active streaming C2H engine.
-Allocation occurs on the first nonzero read, rather than at module load.
+Choose packet_bytes to match the FPGA producer, not the application's read
+count. The 1024-byte value above is an example. Enabling slots without a
+valid explicit packet length makes the first nonzero FIFO read fail with
+EINVAL; the driver does not assume a DiffTest-specific packet size.
+
+Payload capacity is slots * packet_bytes. Descriptor storage is slots * 32
+bytes. The example allocates 128 KiB of payload and 4 KiB of descriptors
+per active streaming C2H engine; a 256-slot, 768-byte DiffTest configuration
+allocates 192 KiB and 8 KiB respectively. Slots and packet length can be
+selected independently within their supported ranges. With an 8-slot ring,
+the default credit batch automatically becomes 8.
+
+The parameters apply to all FIFO-enabled C2H streaming engines and are
+read-only after module load. Stop readers and reload the module to resize;
+there is no per-read reconfiguration. Allocation occurs on the first nonzero
+read, rather than at module load. Configure larger application retention
+pools separately; their memory is not part of the driver's coherent ring.
 
 FIFO mode requires the hardware C2H descriptor-credit facility and packets
 whose payload length is **exactly** `c2h_fifo_frame_bytes`, including the final
@@ -35,7 +51,7 @@ FIFO reads with `EOPNOTSUPP`; it does not silently switch to another path.
 ## Application interface
 
 ```c
-ssize_t received = read(fd, buffer, 768);
+ssize_t received = read(fd, buffer, buffer_size);
 ```
 
 Each read returns at most the remainder of one completed packet, even when
@@ -83,6 +99,23 @@ fault injection and hot removal during an active FIFO are not covered.
 Kernel start/close messages report the ring configuration, consumed bytes
 and packets, credit updates, peak completed packets, and empty-wait time.
 These per-engine counters are diagnostics, not a new userspace ABI.
+
+## DiffTest configuration
+
+The ordinary DiffTest path opens the C2H node and repeatedly requests
+sizeof(FpgaPackgeHead) bytes. Its generated batch size and host AXIS width
+determine that structure's length; it does not set driver ring parameters
+between reads. Set c2h_fifo_frame_bytes to the corresponding complete FPGA
+packet length when loading the module. For the tested configuration:
+
+```sh
+sudo insmod ./xdma-chr.ko c2h_fifo_frame_bytes=768 c2h_fifo_slots=256
+```
+
+The read count only bounds how many bytes are copied by that call. A partial
+read neither resizes the ring nor changes descriptor packet lengths. The
+number of application buffers and the eight DiffTest batch elements in
+FpgaPackgeHead do not tell the driver how many DMA slots to allocate.
 
 ## Validation
 

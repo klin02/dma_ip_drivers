@@ -11,13 +11,13 @@ static unsigned int c2h_fifo_slots;
 module_param(c2h_fifo_slots, uint, 0444);
 MODULE_PARM_DESC(c2h_fifo_slots, "C2H read FIFO slots (0 disables, 2..512)");
 
-static unsigned int c2h_fifo_frame_bytes = 768;
+static unsigned int c2h_fifo_frame_bytes;
 module_param(c2h_fifo_frame_bytes, uint, 0444);
-MODULE_PARM_DESC(c2h_fifo_frame_bytes, "Fixed C2H packet size (64..65536 bytes, multiple of 64)");
+MODULE_PARM_DESC(c2h_fifo_frame_bytes, "Required C2H packet size when FIFO enabled (64..65536 bytes, multiple of 64)");
 
-static unsigned int c2h_fifo_credit_batch = 32;
+static unsigned int c2h_fifo_credit_batch;
 module_param(c2h_fifo_credit_batch, uint, 0444);
-MODULE_PARM_DESC(c2h_fifo_credit_batch, "Consumed slots per credit update (1..c2h_fifo_slots)");
+MODULE_PARM_DESC(c2h_fifo_credit_batch, "Consumed slots per credit update (0 selects min(32, slots), otherwise 1..slots)");
 
 struct xdma_c2h_fifo {
 	struct xdma_desc *descs;
@@ -30,6 +30,7 @@ struct xdma_c2h_fifo {
 	unsigned int next;
 	unsigned int offset;
 	unsigned int pending_credits;
+	unsigned int credit_batch;
 	bool running;
 	int error;
 	unsigned int peak_available;
@@ -87,7 +88,7 @@ static int fifo_start(struct xdma_engine *engine)
 
 	if (c2h_fifo_slots < 2 || c2h_fifo_slots > 512 ||
 	    c2h_fifo_frame_bytes < 64 || c2h_fifo_frame_bytes > 65536 ||
-	    c2h_fifo_frame_bytes % 64 || !c2h_fifo_credit_batch ||
+	    c2h_fifo_frame_bytes % 64 ||
 	    c2h_fifo_credit_batch > c2h_fifo_slots)
 		return -EINVAL;
 	if (ioread32(&engine->regs->status) & XDMA_STAT_BUSY)
@@ -95,6 +96,8 @@ static int fifo_start(struct xdma_engine *engine)
 	fifo = kzalloc(sizeof(*fifo), GFP_KERNEL);
 	if (!fifo)
 		return -ENOMEM;
+	fifo->credit_batch = c2h_fifo_credit_batch ? c2h_fifo_credit_batch :
+		min(32U, c2h_fifo_slots);
 	fifo->descs = dma_alloc_coherent(dev,
 		c2h_fifo_slots * sizeof(*fifo->descs), &fifo->desc_dma, GFP_KERNEL);
 	fifo->data = dma_alloc_coherent(dev, c2h_fifo_slots * c2h_fifo_frame_bytes,
@@ -148,7 +151,7 @@ static int fifo_start(struct xdma_engine *engine)
 	engine->fifo = fifo;
 	pr_info("%s: C2H read FIFO started slots=%u packet_bytes=%u credit_batch=%u\n",
 		engine->name, c2h_fifo_slots, c2h_fifo_frame_bytes,
-		c2h_fifo_credit_batch);
+		fifo->credit_batch);
 	return 0;
 }
 
@@ -256,7 +259,7 @@ ssize_t xdma_fifo_read(struct xdma_engine *engine, char __user *buf,
 		fifo->next = (fifo->next + 1) % c2h_fifo_slots;
 		fifo->packets++;
 		fifo->pending_credits++;
-		if (fifo->pending_credits >= c2h_fifo_credit_batch)
+		if (fifo->pending_credits >= fifo->credit_batch)
 			fifo_return_credits(engine);
 	}
 	return bytes;
