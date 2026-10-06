@@ -11,10 +11,6 @@ static unsigned int c2h_fifo_slots = 256;
 module_param(c2h_fifo_slots, uint, 0444);
 MODULE_PARM_DESC(c2h_fifo_slots, "C2H read FIFO slots (default 256, 0 disables, 2..512)");
 
-static unsigned int c2h_fifo_frame_bytes;
-module_param(c2h_fifo_frame_bytes, uint, 0444);
-MODULE_PARM_DESC(c2h_fifo_frame_bytes, "C2H FIFO packet size (0 keeps legacy read, 64..65536 bytes, multiple of 64)");
-
 static unsigned int c2h_fifo_credit_batch;
 module_param(c2h_fifo_credit_batch, uint, 0444);
 MODULE_PARM_DESC(c2h_fifo_credit_batch, "Consumed slots per credit update (0 selects min(32, slots), otherwise 1..slots)");
@@ -31,6 +27,7 @@ struct xdma_c2h_fifo {
 	unsigned int offset;
 	unsigned int pending_credits;
 	unsigned int credit_batch;
+	unsigned int frame_bytes;
 	bool running;
 	int error;
 	unsigned int peak_available;
@@ -43,7 +40,7 @@ struct xdma_c2h_fifo {
 
 bool xdma_fifo_enabled(struct xdma_engine *engine)
 {
-	return c2h_fifo_slots && c2h_fifo_frame_bytes && engine->streaming &&
+	return c2h_fifo_slots && engine->streaming &&
 		engine->dir == DMA_FROM_DEVICE;
 }
 
@@ -59,7 +56,7 @@ static void fifo_free(struct xdma_engine *engine, struct xdma_c2h_fifo *fifo)
 	struct device *dev = &engine->xdev->pdev->dev;
 
 	if (fifo->data)
-		dma_free_coherent(dev, c2h_fifo_slots * c2h_fifo_frame_bytes,
+		dma_free_coherent(dev, c2h_fifo_slots * fifo->frame_bytes,
 				  fifo->data, fifo->data_dma);
 	if (fifo->descs)
 		dma_free_coherent(dev, c2h_fifo_slots * sizeof(*fifo->descs),
@@ -78,7 +75,7 @@ static unsigned int fifo_adjacent(struct xdma_c2h_fifo *fifo, unsigned int index
 	return min(63 - block_index, c2h_fifo_slots - index - 1);
 }
 
-static int fifo_start(struct xdma_engine *engine)
+static int fifo_start(struct xdma_engine *engine, size_t count)
 {
 	struct device *dev = &engine->xdev->pdev->dev;
 	struct sgdma_common_regs *common = fifo_common(engine);
@@ -87,8 +84,7 @@ static int fifo_start(struct xdma_engine *engine)
 	u32 credit_bit = BIT(16 + engine->channel);
 
 	if (c2h_fifo_slots < 2 || c2h_fifo_slots > 512 ||
-	    c2h_fifo_frame_bytes < 64 || c2h_fifo_frame_bytes > 65536 ||
-	    c2h_fifo_frame_bytes % 64 ||
+	    count < 64 || count > 65536 || count % 64 ||
 	    c2h_fifo_credit_batch > c2h_fifo_slots)
 		return -EINVAL;
 	if (ioread32(&engine->regs->status) & XDMA_STAT_BUSY)
@@ -96,11 +92,13 @@ static int fifo_start(struct xdma_engine *engine)
 	fifo = kzalloc(sizeof(*fifo), GFP_KERNEL);
 	if (!fifo)
 		return -ENOMEM;
+	/* The first read supplies the fixed packet length for this engine. */
+	fifo->frame_bytes = count;
 	fifo->credit_batch = c2h_fifo_credit_batch ? c2h_fifo_credit_batch :
 		min(32U, c2h_fifo_slots);
 	fifo->descs = dma_alloc_coherent(dev,
 		c2h_fifo_slots * sizeof(*fifo->descs), &fifo->desc_dma, GFP_KERNEL);
-	fifo->data = dma_alloc_coherent(dev, c2h_fifo_slots * c2h_fifo_frame_bytes,
+	fifo->data = dma_alloc_coherent(dev, c2h_fifo_slots * fifo->frame_bytes,
 		&fifo->data_dma, GFP_KERNEL);
 	if (!fifo->descs || !fifo->data) {
 		fifo_free(engine, fifo);
@@ -111,7 +109,7 @@ static int fifo_start(struct xdma_engine *engine)
 		struct xdma_desc *desc = fifo->descs + i;
 		dma_addr_t next = fifo->desc_dma +
 			((i + 1) % c2h_fifo_slots) * sizeof(*desc);
-		dma_addr_t data = fifo->data_dma + i * c2h_fifo_frame_bytes;
+		dma_addr_t data = fifo->data_dma + i * fifo->frame_bytes;
 		unsigned int adjacent;
 
 		/* Bound the NEXT fetch by its 64-descriptor block and the ring end. */
@@ -119,7 +117,7 @@ static int fifo_start(struct xdma_engine *engine)
 
 		desc->control = cpu_to_le32(DESC_MAGIC | (adjacent << DESC_ADJ_SHIFT) |
 			XDMA_DESC_COMPLETED);
-		desc->bytes = cpu_to_le32(c2h_fifo_frame_bytes);
+		desc->bytes = cpu_to_le32(fifo->frame_bytes);
 		desc->dst_addr_lo = cpu_to_le32(lower_32_bits(data));
 		desc->dst_addr_hi = cpu_to_le32(upper_32_bits(data));
 		desc->next_lo = cpu_to_le32(lower_32_bits(next));
@@ -150,7 +148,7 @@ static int fifo_start(struct xdma_engine *engine)
 	engine->running = 1;
 	engine->fifo = fifo;
 	pr_info("%s: C2H read FIFO started slots=%u packet_bytes=%u credit_batch=%u\n",
-		engine->name, c2h_fifo_slots, c2h_fifo_frame_bytes,
+		engine->name, c2h_fifo_slots, fifo->frame_bytes,
 		fifo->credit_batch);
 	return 0;
 }
@@ -182,18 +180,19 @@ ssize_t xdma_fifo_read(struct xdma_engine *engine, char __user *buf,
 	unsigned int polls = 0;
 	unsigned int timeout = READ_ONCE(c2h_timeout_ms);
 	u32 completed, available, writeback;
-	u32 length = c2h_fifo_frame_bytes;
+	u32 length;
 	size_t bytes;
 	int rv;
 
 	if (!count)
 		return 0;
 	if (!engine->fifo) {
-		rv = fifo_start(engine);
+		rv = fifo_start(engine, count);
 		if (rv)
 			return rv;
 	}
 	fifo = engine->fifo;
+	length = fifo->frame_bytes;
 	if (fifo->error)
 		return fifo->error;
 	deadline = jiffies + msecs_to_jiffies(timeout);
@@ -249,7 +248,7 @@ ssize_t xdma_fifo_read(struct xdma_engine *engine, char __user *buf,
 	dma_rmb();
 	bytes = min_t(size_t, count, length - fifo->offset);
 	if (copy_to_user(buf, (char *)fifo->data +
-		fifo->next * c2h_fifo_frame_bytes + fifo->offset, bytes))
+		fifo->next * fifo->frame_bytes + fifo->offset, bytes))
 		return -EFAULT;
 	fifo->offset += bytes;
 	fifo->bytes += bytes;
