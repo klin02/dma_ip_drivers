@@ -1384,6 +1384,9 @@ static int engine_destroy(struct xdma_dev *xdev, struct xdma_engine *engine)
 
 	xdma_debug_assert_ptr(engine);
 
+	if (xdma_fifo_close(engine))
+		return -EBUSY;
+
 	dbg_sg("Shutting down engine %s%d", engine->name, engine->channel);
 
 	/* Disable interrupts to stop processing new events during shutdown */

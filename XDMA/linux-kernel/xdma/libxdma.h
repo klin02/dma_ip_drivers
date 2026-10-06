@@ -448,6 +448,8 @@ struct xdma_transfer {
 #define XENGINE_OPEN_BIT 0L
 #define XENGINE_BUSY_BIT 1L
 
+struct xdma_c2h_fifo;
+
 struct xdma_engine {
 	unsigned int magic;	/* structure ID for sanity checks */
 	struct xdma_dev *xdev;	/* parent device */
@@ -478,6 +480,7 @@ struct xdma_engine {
 	const unsigned desc_max;		/* max # descriptors per xfer */
 	struct xdma_transfer_params transfer_params;
 	struct xdma_transfer transfer;
+	struct xdma_c2h_fifo *fifo;
 	struct dma_pool *desc_pool;/*DMA pool for descriptors*/
 	struct completion engine_compl;	
 	/* only used for MSIX mode to store per-engine interrupt mask value */
@@ -564,6 +567,11 @@ int xdma_user_isr_enable(void *dev_hndl, unsigned int mask);
 void xdma_device_offline(struct pci_dev *pdev, void *dev_handle);
 void xdma_device_online(struct pci_dev *pdev, void *dev_handle);
 ssize_t xdma_xfer_submit(struct xdma_engine *engine);
+extern unsigned int c2h_timeout_ms;
+bool xdma_fifo_enabled(struct xdma_engine *engine);
+ssize_t xdma_fifo_read(struct xdma_engine *engine, char __user *buf,
+		       size_t count, bool nonblock);
+int xdma_fifo_close(struct xdma_engine *engine);
 struct xdma_transfer *engine_cyclic_stop(struct xdma_engine *engine);
 void enable_perf(struct xdma_engine *engine, bool enable);
 int get_perf_stats(struct xdma_engine *engine, struct xdma_performance_ioctl *__user user_perf_res);
