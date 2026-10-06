@@ -7,13 +7,13 @@
 #include <linux/slab.h>
 #include "libxdma.h"
 
-static unsigned int c2h_fifo_slots;
+static unsigned int c2h_fifo_slots = 256;
 module_param(c2h_fifo_slots, uint, 0444);
-MODULE_PARM_DESC(c2h_fifo_slots, "C2H read FIFO slots (0 disables, 2..512)");
+MODULE_PARM_DESC(c2h_fifo_slots, "C2H read FIFO slots (default 256, 0 disables, 2..512)");
 
 static unsigned int c2h_fifo_frame_bytes;
 module_param(c2h_fifo_frame_bytes, uint, 0444);
-MODULE_PARM_DESC(c2h_fifo_frame_bytes, "Required C2H packet size when FIFO enabled (64..65536 bytes, multiple of 64)");
+MODULE_PARM_DESC(c2h_fifo_frame_bytes, "C2H FIFO packet size (0 keeps legacy read, 64..65536 bytes, multiple of 64)");
 
 static unsigned int c2h_fifo_credit_batch;
 module_param(c2h_fifo_credit_batch, uint, 0444);
@@ -43,7 +43,7 @@ struct xdma_c2h_fifo {
 
 bool xdma_fifo_enabled(struct xdma_engine *engine)
 {
-	return c2h_fifo_slots && engine->streaming &&
+	return c2h_fifo_slots && c2h_fifo_frame_bytes && engine->streaming &&
 		engine->dir == DMA_FROM_DEVICE;
 }
 

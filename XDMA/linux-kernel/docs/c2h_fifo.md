@@ -18,14 +18,28 @@ sudo insmod ./xdma-chr.ko c2h_fifo_frame_bytes="$packet_bytes" \
 
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
-| `c2h_fifo_slots` | 0 | Disabled at 0; enabled ring capacity is 2..512 packets |
-| `c2h_fifo_frame_bytes` | 0 | Required when enabled: packet length, 64..65536 bytes, multiple of 64 |
+| `c2h_fifo_slots` | 256 | Ring capacity in packets; 2..512, or 0 to disable FIFO |
+| `c2h_fifo_frame_bytes` | 0 | Keeps legacy read at 0; explicit FIFO packet length is 64..65536 bytes, multiple of 64 |
 | `c2h_fifo_credit_batch` | 0 | Auto selects min(32, slots); an explicit value must be 1..slots |
 
 Choose packet_bytes to match the FPGA producer, not the application's read
-count. The 1024-byte value above is an example. Enabling slots without a
-valid explicit packet length makes the first nonzero FIFO read fail with
-EINVAL; the driver does not assume a DiffTest-specific packet size.
+count. The 1024-byte value above is an example. With packet_bytes unset or
+zero, the driver retains the original per-read DMA path, whose transfer
+request length comes from read's count. There was no 768-byte packet default
+in that original path. A nonzero packet length opts into FIFO when slots is
+also nonzero; invalid nonzero packet lengths fail FIFO reads with EINVAL.
+Setting slots=0 explicitly keeps the legacy path regardless of packet length.
+
+For the tested 768-byte FPGA protocol, the default ring has 256 slots:
+
+```sh
+sudo insmod ./xdma-chr.ko c2h_fifo_frame_bytes=768
+# Override capacity at module load when needed:
+sudo insmod ./xdma-chr.ko c2h_fifo_frame_bytes=768 c2h_fifo_slots=128
+```
+
+These are alternative module-load commands. The default of 256 is a slot
+count, not a byte capacity; data memory is allocated only when FIFO starts.
 
 Payload capacity is slots * packet_bytes. Descriptor storage is slots * 32
 bytes. The example allocates 128 KiB of payload and 4 KiB of descriptors
