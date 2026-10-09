@@ -56,6 +56,11 @@ static ssize_t char_sgdma_read_write(struct file *filp, const char __user *buf,
 	/*guard against attempts for simultaneous transfer*/
 	if(xdma_device_test_offline(xcdev->xdev) || test_and_set_bit_lock(XENGINE_BUSY_BIT, &(engine->flags)))
 		return -EBUSY;
+	if (xdma_fifo_enabled(engine)) {
+		rv = xdma_fifo_read(engine, (char __user *)buf, count,
+				    filp->f_flags & O_NONBLOCK);
+		goto read_done;
+	}
 	/*just fill transfer params. checks are performed later inside xdma_xfer_submit*/
 	engine->transfer_params.buf=buf;
 	engine->transfer_params.length=count;
@@ -70,6 +75,7 @@ static ssize_t char_sgdma_read_write(struct file *filp, const char __user *buf,
 	if(!engine->streaming && !engine->non_incr_addr &&(rv>0))
 		*pos+=rv;
 	
+read_done:
 	clear_bit_unlock(XENGINE_BUSY_BIT, &(engine->flags));
 	return rv;
 }
@@ -214,6 +220,11 @@ static long char_sgdma_ioctl(struct file *filp, unsigned int cmd,
 	engine = xcdev->engine;
 	if(xdma_device_test_offline(xdev))
 		return -EBUSY;
+	/* FIFO owns this C2H engine; queries remain available. */
+	if (xdma_fifo_enabled(engine) &&
+	    (cmd == XDMA_IOCTL_SUBMIT_TRANSFER || cmd == XDMA_IOCTL_PERF_TEST ||
+	     cmd == XDMA_IOCTL_ADDRMODE_SET))
+		return -EBUSY;
 		
 	switch (cmd) {
 	case XDMA_IOCTL_PERF_TEST:
@@ -320,6 +331,9 @@ static int char_sgdma_close(struct inode *inode, struct file *filp)
 		return rv;
 
 	engine = xcdev->engine;
+	rv = xdma_fifo_close(engine);
+	if (rv)
+		return rv;
 
 	/* Recover a BUSY bit left behind when a transfer exited abnormally. */
 	if (test_bit(XENGINE_BUSY_BIT, &engine->flags)) {
