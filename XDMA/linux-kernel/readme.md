@@ -66,6 +66,12 @@ are devised:
     - There is no way for driver to figure out, if descriptor bypass was selected for a channel
     - How the logic on FPGA is supposed to learn the DMA Addresses on the host?
 
+### Fixed-packet C2H FIFO
+
+An optional driver-owned receive ring keeps streaming C2H DMA running across
+ordinary `read()` calls. It requires polling mode, descriptor credits and a
+fixed packet length. See [C2H FIFO configuration and read semantics](./docs/c2h_fifo.md).
+
 ### Known issues
 - I have no ability to test on different kernel versions. That is why the driver may fail 
 to compile because of typos and syntax errors in the version fenced sections.
