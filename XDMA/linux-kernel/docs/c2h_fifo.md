@@ -56,11 +56,10 @@ their existing paths. IRQ builds reject enabled FIFO reads with
 ssize_t received = read(fd, buffer, packet_size);
 ```
 
-Each read returns at most the remainder of one completed packet, even when
-later read counts are larger. It returns as soon as that packet completes;
-it does not wait for the entire ring to fill. A smaller count after
-initialization leaves remaining packet bytes for the next read. The caller
-must check the returned byte count, as for other read interfaces.
+At a packet boundary, a whole-packet request can return multiple completed
+packets without crossing the ring end or waiting to fill the request. Other
+reads return at most the remainder of the current packet. The caller must
+check the returned byte count.
 
 - A zero-length read returns zero without starting DMA.
 - An empty blocking read polls completion writeback and waits for a packet.
@@ -105,11 +104,10 @@ per-engine counters are diagnostics, not a new userspace ABI.
 
 ## DiffTest configuration
 
-The ordinary DiffTest path opens the C2H node and repeatedly requests
-`sizeof(FpgaPackgeHead)` bytes. Its generated batch size and host AXIS width
-determine that structure's length. The first read therefore supplies the
-FIFO packet length without any new DiffTest code or configuration between
-reads. Load the driver normally for 256 slots, or override only slot count.
+The ordinary DiffTest path opens the C2H node and first requests
+`sizeof(FpgaPackgeHead)` bytes to set the FIFO packet length. Its generated
+batch size and host AXIS width determine that structure's length. Load the
+driver normally for 256 slots, or override only the slot count.
 
 Subsequent read counts bound the bytes copied by that call. A partial read
 neither resizes the ring nor changes descriptor packet lengths. The number
