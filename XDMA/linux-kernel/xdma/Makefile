@@ -39,44 +39,44 @@ topdir := $(shell cd $(src)/.. && pwd)
 
 TARGET_MODULE:=xdma-chr
 
-EXTRA_CFLAGS := -I$(topdir)/include $(XVC_FLAGS)
+ccflags-y := -I$(topdir)/include $(XVC_FLAGS)
 ifeq ($(DEBUG),1)
-	EXTRA_CFLAGS += -D__LIBXDMA_DEBUG__
+	ccflags-y += -D__LIBXDMA_DEBUG__
 endif
 ifneq ($(config_bar_num),)
-	EXTRA_CFLAGS += -DXDMA_CONFIG_BAR_NUM=$(config_bar_num)
+	ccflags-y += -DXDMA_CONFIG_BAR_NUM=$(config_bar_num)
 endif
 
 ifneq ($(c2h_credits),)
-	EXTRA_CFLAGS += -DXDMA_C2H_CREDITS=$(c2h_credits)
+	ccflags-y += -DXDMA_C2H_CREDITS=$(c2h_credits)
 endif
 ifneq ($(h2c_timeout),)
-	EXTRA_CFLAGS += -DXDMA_H2C_TIMEOUT=$(h2c_timeout)
+	ccflags-y += -DXDMA_H2C_TIMEOUT=$(h2c_timeout)
 endif
 ifneq ($(c2h_timeout),)
-	EXTRA_CFLAGS += -DXDMA_C2H_TIMEOUT=$(c2h_timeout)
+	ccflags-y += -DXDMA_C2H_TIMEOUT=$(c2h_timeout)
 endif
 POLLING ?= 1
 ifeq ($(POLLING),1)
-	EXTRA_CFLAGS += -DXDMA_POLL_MODE
+	ccflags-y += -DXDMA_POLL_MODE
 endif
 
 ifneq ($(PREFIX),)
-	EXTRA_CFLAGS += -DXDMA_PREFIX='"$(PREFIX)"'
+	ccflags-y += -DXDMA_PREFIX='"$(PREFIX)"'
 endif
 
 ifeq ($(HIERARCHICAL),1)
-	EXTRA_CFLAGS += -DXDMA_HIERARCHICAL_DEVICES
+	ccflags-y += -DXDMA_HIERARCHICAL_DEVICES
 endif
 ifneq ($(VENDOR_ID),)
-	EXTRA_CFLAGS += -DXDMA_VENDOR_ID=$(VENDOR_ID)
+	ccflags-y += -DXDMA_VENDOR_ID=$(VENDOR_ID)
 endif
 
 ifneq ($(DEVICE_ID),)
-	EXTRA_CFLAGS += -DXDMA_DEVICE_ID=$(DEVICE_ID)
+	ccflags-y += -DXDMA_DEVICE_ID=$(DEVICE_ID)
 endif
 
-#EXTRA_CFLAGS += -DINTERNAL_TESTING
+#ccflags-y += -DINTERNAL_TESTING
 
 ifneq ($(KERNELRELEASE),)
 	$(TARGET_MODULE)-objs := libxdma.o c2h_fifo.o xdma_cdev.o cdev_ctrl.o cdev_events.o cdev_sgdma.o cdev_xvc.o cdev_bypass.o xdma_mod.o
