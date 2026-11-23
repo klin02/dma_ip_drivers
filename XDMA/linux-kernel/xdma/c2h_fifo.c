@@ -180,7 +180,7 @@ ssize_t xdma_fifo_read(struct xdma_engine *engine, char __user *buf,
 	unsigned int polls = 0;
 	unsigned int timeout = READ_ONCE(c2h_timeout_ms);
 	u32 completed, available, writeback;
-	u32 length;
+	u32 length, packets = 1;
 	size_t bytes;
 	int rv;
 
@@ -247,19 +247,28 @@ ssize_t xdma_fifo_read(struct xdma_engine *engine, char __user *buf,
 	/* Count writeback follows the payload DMA writes. Packet size is fixed. */
 	dma_rmb();
 	bytes = min_t(size_t, count, length - fifo->offset);
+	/* Return one contiguous span; the next read handles a ring wrap. */
+	if (!fifo->offset && count > length && count % length == 0) {
+		packets = min_t(size_t, count / length,
+				min(available, c2h_fifo_slots - fifo->next));
+		bytes = (size_t)packets * length;
+	}
 	if (copy_to_user(buf, (char *)fifo->data +
 		fifo->next * fifo->frame_bytes + fifo->offset, bytes))
 		return -EFAULT;
-	fifo->offset += bytes;
 	fifo->bytes += bytes;
-	if (fifo->offset == length) {
-		fifo->consumed_count = (fifo->consumed_count + 1) & WB_COUNT_MASK;
+	if (bytes >= length - fifo->offset) {
+		fifo->consumed_count = (fifo->consumed_count + packets) & WB_COUNT_MASK;
 		fifo->offset = 0;
-		fifo->next = (fifo->next + 1) % c2h_fifo_slots;
-		fifo->packets++;
-		fifo->pending_credits++;
+		fifo->next += packets;
+		if (fifo->next == c2h_fifo_slots)
+			fifo->next = 0;
+		fifo->packets += packets;
+		fifo->pending_credits += packets;
 		if (fifo->pending_credits >= fifo->credit_batch)
 			fifo_return_credits(engine);
+	} else {
+		fifo->offset += bytes;
 	}
 	return bytes;
 
