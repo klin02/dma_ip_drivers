@@ -192,7 +192,7 @@ static inline u32 build_u32(u32 hi, u32 lo)
 
 static inline u64 build_u64(u64 hi, u64 lo)
 {
-	return ((hi & 0xFFFFFFFULL) << 32) | (lo & 0xFFFFFFFFULL);
+	return ((hi & 0xFFFFFFFFULL) << 32) | (lo & 0xFFFFFFFFULL);
 }
 
 static void check_nonzero_interrupt_status(struct xdma_dev *xdev)
@@ -291,15 +291,6 @@ static u32 read_interrupts(struct xdma_dev *xdev)
 
 	/* return interrupts: user in upper 16-bits, channel in lower 16-bits */
 	return build_u32(hi, lo);
-}
-
-void enable_perf(struct xdma_engine *engine, bool enable)
-{
-	u32 w= enable? XDMA_PERF_AUTO | XDMA_PERF_RUN: XDMA_PERF_CLEAR;
-	write_register(w, &engine->regs->perf_ctrl,
-		       (unsigned long)(&engine->regs->perf_ctrl) -
-			       (unsigned long)(&engine->regs));
-	dbg_perf("XDMA_IOCTL_PERF_TEST %s\n", enable? "enabled": "disabled");
 }
 
 int get_perf_stats(struct xdma_engine *engine, struct xdma_performance_ioctl *__user user_perf_res)
@@ -445,7 +436,6 @@ static int xdma_engine_stop(struct xdma_engine *engine)
 	write_register(w, &engine->regs->control_w1c,
 			(unsigned long)(&engine->regs->control_w1c) -
 				(unsigned long)(&engine->regs));
-	/* dummy read of status register to flush all previous writes */
 	dbg_tfr("%s(%s) done\n", __func__, engine->name);
 	engine->running = 0;
 	return 0;
@@ -485,7 +475,7 @@ static irqreturn_t xdma_isr(int irq, void *dev_id)
 	dbg_irq("(irq=%d, dev 0x%p) <<<< ISR.\n", irq, dev_id);
 	if (!dev_id) {
 		pr_err("Invalid dev_id on irq line %d\n", irq);
-		return -IRQ_NONE;
+		return IRQ_NONE;
 	}
 	xdev = (struct xdma_dev *)dev_id;
 
@@ -1442,7 +1432,12 @@ static int engine_init_regs(struct xdma_engine *engine)
 			|XDMA_CTRL_IE_DESC_ALIGN_MISMATCH
 			|XDMA_CTRL_IE_DESC_COMPLETED
 			|XDMA_CTRL_IE_DESC_STOPPED);
-	
+
+	/* replay fixed (non-incrementing) address mode so that it survives
+	   re-initialisation through xdma_device_online() after a reset */
+	if (engine->non_incr_addr)
+		control_reg_value |= XDMA_CTRL_NON_INCR_ADDR;
+
 #ifdef XDMA_POLL_MODE
 /* if using polled mode,  enable writeback and configure its address, disable interrupts */
 	engine->poll_mode_wb.virtual_addr->completed_desc_count=0;
@@ -1466,6 +1461,10 @@ static int engine_init_regs(struct xdma_engine *engine)
 			       (unsigned long)(&engine->regs));
 
 	engine->interrupt_enable_mask_value = interrupt_reg_value;
+	/*Permanently enable performance counters to enable accurate data count*/
+	write_register(XDMA_PERF_AUTO | XDMA_PERF_RUN, &(engine->regs->perf_ctrl),
+		       (unsigned long)(&engine->regs->perf_ctrl) -
+			       (unsigned long)(&engine->regs));
 	
 	engine_alignments(engine);
 	/* only enable credit mode for AXI-ST C2H */
@@ -1517,7 +1516,7 @@ err_out:
 	engine_free_resource(engine);
 	return -ENOMEM;*/
 }
-/* register offset for the engine */
+/* register offset for an engine */
 static unsigned int get_engine_offset(enum dma_data_direction dir, int channel)
 {
 	/* read channels at 0x0000, write channels at 0x1000,
@@ -1563,15 +1562,13 @@ static int engine_init(struct xdma_dev *xdev, enum dma_data_direction dir, int c
 	snprintf(engine->name, sizeof(engine->name), "%d-%s%d-%s", xdev->idx,
 		(dir == DMA_TO_DEVICE) ? "H2C" : "C2H", channel,
 		engine->streaming ? "ST" : "MM");
-
-	/*calculate maximum usable register for engine, so that hardware descriptor FIFO would not overflow
-	First clculate size of the FIFO, then total descriptors that fit into it, and divide by number of channels,
-	separately for each diraction. */
-	const_cast(unsigned int, engine->desc_max) = (XDMA_DESC_FIFO_DEPTH * xdev->datapath_width) /sizeof(struct xdma_desc)
-	    				/(dir==DMA_TO_DEVICE? xdev->h2c_channel_num: xdev->c2h_channel_num);
 	
 	    	
-	const_cast(unsigned int, engine->adj_block_len)=engine->xdev->max_read_request_size /sizeof(struct xdma_desc);
+	/* size adjacent blocks to the MRRS, but never above the 64-descriptor
+	   limit of the 6-bit Nxt_adj/dsc_adj fields (MRRS can be 4096) */
+	const_cast(unsigned int, engine->adj_block_len)=min_t(unsigned int,
+		engine->xdev->max_read_request_size /sizeof(struct xdma_desc),
+		XDMA_MAX_ADJ_BLOCK_LEN);
 	dbg_init("engine %p name %s irq_bitmask=0x%08x\n", engine, engine->name,
 		 (unsigned int) (int)engine->irq_bitmask);
 
@@ -1599,8 +1596,6 @@ static int engine_init(struct xdma_dev *xdev, enum dma_data_direction dir, int c
 	#else
 	init_completion(&(engine->engine_compl));
 	#endif
-	/*pr_info("XDMA engine %s can use up to %u descriptors with length of block of adjacent descriptors up to %u", 
-		engine->name,engine->desc_max, engine->adj_block_len);*/
 
 	return 0;
 }
@@ -1623,7 +1618,23 @@ static int xdma_validate_transfer(const struct xdma_engine *engine)
 		return -EINVAL;
 	if(unlikely(transfer_params->length==0))
 		return -EINVAL;
-	rv=position_check(MAX_RESOURCE_SIZE, transfer_params->ep_addr, engine->addr_align, transfer_params->length);
+		
+	if(unlikely(transfer_params->length>rlimit(RLIMIT_MEMLOCK)))
+	{
+		pr_err("Transfer exceeds current limit for memory pinning of %lu Bytes. "
+		"Please increase the memlock limit to appropriate value with setrlimit or in '/etc/security/limit.conf'\n",
+		rlimit(RLIMIT_MEMLOCK));
+		return -ENOMEM;
+	}
+		
+		
+	if(((uintptr_t) transfer_params->buf) & (engine->xdev->datapath_width-1))
+	{
+		pr_err("Data buffer must be aligned to datapath width (%u bytes).\n", engine->xdev->datapath_width);
+		return -EINVAL;
+	}
+	if(!engine->streaming)
+		rv=position_check(MAX_RESOURCE_SIZE, transfer_params->ep_addr, engine->addr_align, transfer_params->length);
 	if(unlikely(rv<0))
 		return rv;
 	if (engine->non_incr_addr)
@@ -1656,53 +1667,50 @@ static int xdma_sgtable_to_descriptors(struct xdma_engine *engine)
 	struct scatterlist *sg_iter=transfer->sgt.sgl;
 	struct scatterlist *sg_prev=NULL;
 	loff_t ep_addr= engine->streaming? : engine->transfer_params.ep_addr;
-	unsigned int block_num=0;
 	unsigned int processed_sg_entries=0;
+	struct xdma_desc *current_desc=NULL;
+	unsigned int allocated_blocks=0;
 	u32 control_flags=(XDMA_DESC_STOPPED|XDMA_DESC_COMPLETED);
 	
 	if(engine->streaming&& (engine->dir==DMA_TO_DEVICE) && engine->eop_flush)
 		control_flags|=XDMA_DESC_EOP;	
 	
 	
-	
-		
-	/*calculate number of adjasent descriptor blocks, for now limited to 1
-	transfer->num_adj_blocks= divide_roundup(transfer->sgt.nents, engine->adj_block_len);*/
-	transfer->num_adj_blocks=1;
-	/*dbg_sg("%u adjacent descriptor blocks are required for transfer on engine %s\n",
-		 transfer->num_adj_blocks, engine->name);*/
-		 
-	/*Dynamically allocated as an array as a provision for possible future splitting into multiple transfers.*/
-	transfer->adj_desc_blocks=kmalloc_array(transfer->num_adj_blocks, 
-		sizeof(*(transfer->adj_desc_blocks)), GFP_KERNEL|__GFP_NORETRY|__GFP_ZERO);
-	if(unlikely(transfer->adj_desc_blocks==NULL))
-	{
-		dbg_sg("Failed to allocate memory for descriptor DMA records on engine %s.\n", engine->name);
-		return -ENOMEM; 
-	}
-	transfer->cleanup_flags|=XFER_FLAG_DMA_RECORD_ALLOC;
 	/* step through blocks of adjacent descriptors*/
-	for(; (block_num<transfer->num_adj_blocks) && (processed_sg_entries < sg_nents); ++block_num)
+	for(; (processed_sg_entries < sg_nents); ++transfer->num_adj_blocks)
 	{
 		unsigned int i=0;
-		unsigned desc_in_block=0;
-		struct xdma_desc *current_desc;
 		dma_addr_t desc_dma_addr;
-				
-		transfer->adj_desc_blocks[block_num].virtual_addr=dma_pool_zalloc(engine->desc_pool,
+		/*we need to allocate (more) memory for adjacent blocks*/
+		if(transfer->num_adj_blocks==allocated_blocks)
+		{	/*allocate in steps of 4 blocks. */
+			allocated_blocks+=4;
+			/*krealloc_array is not available in earlier kernel versions. The overflow, against that it protects, 
+			is unthinkable in this case*/
+			transfer->adj_desc_blocks=krealloc(transfer->adj_desc_blocks,
+			allocated_blocks * sizeof(*(transfer->adj_desc_blocks)), GFP_KERNEL|__GFP_NORETRY|__GFP_ZERO);
+			if(unlikely(transfer->adj_desc_blocks==NULL))
+			{
+				dbg_sg("Failed to allocate memory for descriptor DMA records on engine %s.\n", engine->name);
+				return -ENOMEM; 
+			}
+			transfer->cleanup_flags|=XFER_FLAG_DMA_RECORD_ALLOC;
+		}
+			
+		transfer->adj_desc_blocks[transfer->num_adj_blocks].virtual_addr=dma_pool_zalloc(engine->desc_pool,
 		/*memory is allocated at the first call and then stays in the pool,therefore it is acceptable to wait once*/
 						GFP_KERNEL|__GFP_RETRY_MAYFAIL, &desc_dma_addr);
-		if(unlikely(transfer->adj_desc_blocks[block_num].virtual_addr==NULL))
+		if(unlikely(transfer->adj_desc_blocks[transfer->num_adj_blocks].virtual_addr==NULL))
 		{
-			dbg_sg("Failed to allocate memory from descriptor pool on engine %s\n", engine->name);		
+			pr_err("Failed to allocate coherent memory for descriptors on engine %s\n", engine->name);		
 			return -ENOMEM;
 		}
-		transfer->adj_desc_blocks[block_num].dma_addr=desc_dma_addr;
-		transfer->adj_desc_blocks[block_num].length=engine->adj_block_len*sizeof(struct xdma_desc);
+		transfer->adj_desc_blocks[transfer->num_adj_blocks].dma_addr=desc_dma_addr;
 		transfer->cleanup_flags|=XFER_FLAG_DESC_DMA_ALLOC;
-		
+
 		dbg_sg("Descriptor DMA record %u: virtual address %p, DMA address %pad\n",
-			block_num, transfer->adj_desc_blocks[block_num].virtual_addr, &(transfer->adj_desc_blocks[block_num].dma_addr));
+			transfer->num_adj_blocks, transfer->adj_desc_blocks[transfer->num_adj_blocks].virtual_addr, 
+				&(transfer->adj_desc_blocks[transfer->num_adj_blocks].dma_addr));
 		
 		for(; (processed_sg_entries < sg_nents) && (i<engine->adj_block_len); ++i,  desc_dma_addr+=sizeof(struct xdma_desc))
 		{
@@ -1710,7 +1718,7 @@ static int xdma_sgtable_to_descriptors(struct xdma_engine *engine)
 			unsigned int desc_length=0;
 			unsigned int desc_length_accum=0;
 			dma_addr_t desc_start= sg_dma_address(sg_iter);
-			current_desc=&(transfer->adj_desc_blocks[block_num].virtual_addr[i]);
+			current_desc=&(transfer->adj_desc_blocks[transfer->num_adj_blocks].virtual_addr[i]);
 			
 										
 			dbg_sg("SG entries:\n");
@@ -1738,7 +1746,12 @@ static int xdma_sgtable_to_descriptors(struct xdma_engine *engine)
 		
 		
 		
-		
+			current_desc->control=cpu_to_le32(DESC_MAGIC);
+			/*generate writebacks after each completed register in poll mode.
+			this allows extended wait feature to work correctly*/
+			#ifdef XDMA_POLL_MODE 
+			current_desc->control|=cpu_to_le32(XDMA_DESC_COMPLETED);
+			#endif
 			current_desc->bytes=cpu_to_le32(desc_length);
 			if(engine->dir== DMA_TO_DEVICE)
 			{
@@ -1775,26 +1788,35 @@ static int xdma_sgtable_to_descriptors(struct xdma_engine *engine)
 					
 			
 		}
-		/*there are still unprocessed sg entries. Transfer doesn't fit into single adjacent block*/
-		if ( processed_sg_entries<sg_nents)
+		transfer->adj_desc_blocks[transfer->num_adj_blocks].length=i;/*repurpose length field for the number of descriptors in the block)*/
+                transfer->total_descriptors+=transfer->adj_desc_blocks[transfer->num_adj_blocks].length;
+			
+		/*link to previous block.  it has always max length*/
+                if(transfer->num_adj_blocks>0)
+                {
+                        split_into_val32(transfer->adj_desc_blocks[transfer->num_adj_blocks].dma_addr, 
+                        	transfer->adj_desc_blocks[transfer->num_adj_blocks-1].virtual_addr[engine->adj_block_len-1].next_hi,
+                                transfer->adj_desc_blocks[transfer->num_adj_blocks-1].virtual_addr[engine->adj_block_len-1].next_lo);
+                        
+                        transfer->adj_desc_blocks[transfer->num_adj_blocks-1].virtual_addr[engine->adj_block_len-1].control|= 
+                        	cpu_to_le32((transfer->adj_desc_blocks[transfer->num_adj_blocks].length-1)<<DESC_ADJ_SHIFT);
+                        /*dump_sg_with_desc(sg_prev,&(transfer->adj_desc_blocks[transfer->num_adj_blocks-1].virtual_addr[engine->adj_block_len-1]));*/
+                        
+                }
+                
+		if(transfer->adj_desc_blocks[transfer->num_adj_blocks].length>2)/*desc next adjacent*/
 		{
-			pr_err("Transfer requires more than a single block of %u adjacent descripors."
-			"Splitting into multiple transfers is required, but currently not implemented", 
-			engine->adj_block_len);
-			return -EFBIG;
-		}
-		/*set control flags on the very last descriptor*/
-		current_desc->control|=cpu_to_le32(control_flags);
-		desc_in_block=i;
-		for(i=0; i<desc_in_block; ++i)/*desc magic and next adjacent*/
-		{
-			transfer->adj_desc_blocks[block_num].virtual_addr[i].control|= cpu_to_le32(DESC_MAGIC|((desc_in_block-i-1)<<DESC_ADJ_SHIFT));
+			unsigned int j=0;
+			for(i=transfer->adj_desc_blocks[transfer->num_adj_blocks].length-2; i>0; --i, ++j)
+			{
+				transfer->adj_desc_blocks[transfer->num_adj_blocks].virtual_addr[j].control|= cpu_to_le32(i<<DESC_ADJ_SHIFT);
+			}
 		}
 		//dump_desc(current_desc);
 	}
 	
-	
-
+	/*set control flags on the very last descriptor*/
+	current_desc->control|=cpu_to_le32(control_flags);
 	return 0;
 }
 
@@ -1847,10 +1869,10 @@ static int xdma_prepare_transfer(struct xdma_engine *engine)
 	#if LINUX_VERSION_CHECK(5,6,0)
 	/*pin_user_pages (not get_...) should be used in DMA application. see Linux docs*/
 	rv=pin_user_pages_fast((unsigned long)transfer_params->buf, transfer->num_pages,
-				FOLL_WRITE, transfer->pages);
+				engine->dir == DMA_FROM_DEVICE ? FOLL_WRITE : 0, transfer->pages);
 	#else
 	rv=get_user_pages_fast((unsigned long)transfer_params->buf, transfer->num_pages,
-				FOLL_WRITE, transfer->pages);
+				engine->dir == DMA_FROM_DEVICE ? FOLL_WRITE : 0, transfer->pages);
 	#endif
 	if(unlikely(rv<0))
 	{
@@ -1910,12 +1932,6 @@ static int xdma_prepare_transfer(struct xdma_engine *engine)
 	return rv;	
 }
 
-/*retrieve first adjacent count from an adjacent block. can be used for setting up transfer as well
-as to figure out the number of descriptors in the block */
-static inline u32 get_initial_adj_count(struct xdma_engine *engine, unsigned int adj_block_num)
-{
-	return (le32_to_cpu(engine->transfer.adj_desc_blocks[adj_block_num].virtual_addr[0].control) & DESC_ADJ_MASK)>>DESC_ADJ_SHIFT;
-}
 
 static void xdma_launch_transfer(struct xdma_engine *engine)
 {
@@ -1929,7 +1945,7 @@ static void xdma_launch_transfer(struct xdma_engine *engine)
 #endif
 	write_register((u32) first_desc_addr, &(engine->sgdma_regs->first_desc_lo), 0);
 	write_register((u32) (first_desc_addr>>32), &(engine->sgdma_regs->first_desc_hi), 0);
-	write_register(get_initial_adj_count(engine, 0), &(engine->sgdma_regs->first_desc_adjacent), 0);
+	write_register((u32) engine->transfer.adj_desc_blocks[0].length-1, &(engine->sgdma_regs->first_desc_adjacent), 0);
 	
 	
 	write_register(XDMA_CTRL_RUN_STOP, &(engine->regs->control_w1s), 0);
@@ -1937,23 +1953,30 @@ static void xdma_launch_transfer(struct xdma_engine *engine)
 								
 }
 
-/*In case of timeout the function checks, if some progress has been made, that means descriptors were completed.
+static u64 get_data_count(struct xdma_engine *engine)
+{
+	
+	u32 hi = read_register(&(engine->regs->perf_dat_hi));
+	u32 lo = read_register(&(engine->regs->perf_dat_lo));
+	return build_u64(hi & ~XDMA_PERF_COUNT_OVERFLOW, lo);
+}
+
+/*In case of timeout the function checks, if some progress has been made.
 	If so wait longer for a timeout period to allow transfer to proceed*/
 static long xdma_wait_for_transfer(struct xdma_engine *engine)
 {
-	u32 last_completed_descriptors=0;
+	u64 last_data_count=0;
 	unsigned int timeout=(engine->dir==DMA_TO_DEVICE)? h2c_timeout_ms: c2h_timeout_ms;
 	unsigned long timeout_jiffies=(timeout==0)? MAX_SCHEDULE_TIMEOUT : msecs_to_jiffies(timeout);
 #ifdef XDMA_POLL_MODE
 	unsigned long jiffies_limit= jiffies + timeout_jiffies;
-	unsigned int descriptors_count= get_initial_adj_count(engine, 0)+1;/*this gives the number of descriptors in an adjacent block*/
 	/*replicates behaviour of wait_for_completion for unified handling of transfer result*/
 	do
 	{	
 		u32 poll_wb=engine->poll_mode_wb.virtual_addr->completed_desc_count;
 		u32 current_completed_descriptors=poll_wb & WB_COUNT_MASK;
 		/*return a positive value. xdma_finalise_transfer will deal with it appropriately*/
-		if((current_completed_descriptors >= descriptors_count) || (poll_wb & WB_ERR_MASK))
+		if((current_completed_descriptors >= engine->transfer.total_descriptors) || (poll_wb & WB_ERR_MASK))
 		{
 			dbg_tfr("Poll mode readback: %x\n", poll_wb);
 			return 1;
@@ -1961,10 +1984,11 @@ static long xdma_wait_for_transfer(struct xdma_engine *engine)
 		/* return 0 to signify timeout*/
 		if (timeout>0  && time_after_eq(jiffies, jiffies_limit))
 		{
-			if(current_completed_descriptors > last_completed_descriptors)
+			u64 current_data_count=get_data_count(engine);
+			if(current_data_count > last_data_count)
 			{
 				jiffies_limit= jiffies + timeout_jiffies;//reset timer;
-				last_completed_descriptors=current_completed_descriptors;
+				last_data_count=current_data_count;
 				
 			}
 			else
@@ -1972,7 +1996,7 @@ static long xdma_wait_for_transfer(struct xdma_engine *engine)
 				
 		}
 	/*catch signals*/
-	} while(!signal_pending(current) && !((timeout==0)&&xdma_device_test_offline(engine->xdev)));
+	} while(!signal_pending(current) && !xdma_device_test_offline(engine->xdev));
 	/*like wait for completion*/
 	return -ERESTARTSYS;
 	
@@ -1980,9 +2004,9 @@ static long xdma_wait_for_transfer(struct xdma_engine *engine)
 	long rv;
 	while((rv=wait_for_completion_interruptible_timeout( &(engine->engine_compl), timeout_jiffies))==0)
 	{
-		u32 current_completed_descriptors=ioread32( &(engine->regs->completed_desc_count));
-		if(current_completed_descriptors > last_completed_descriptors)
-			last_completed_descriptors=current_completed_descriptors;
+		u64 current_data_count=get_data_count(engine);
+		if(current_data_count > last_data_count)
+			last_data_count=current_data_count;
 		else
 			break;
 	}
@@ -1994,17 +2018,6 @@ static long xdma_wait_for_transfer(struct xdma_engine *engine)
 	
 	return rv;
 #endif
-}
-
-static ssize_t calculate_completed_length(const struct xdma_engine *engine, u32 num_descriptors)
-{
-	ssize_t completed_length=0;
-	unsigned int i=0;
-	for(; i< num_descriptors; ++i)
-		completed_length += engine->transfer.adj_desc_blocks[0].virtual_addr[i].bytes;
-		
-	return completed_length;
-
 }
 
 static ssize_t xdma_finalise_transfer(struct xdma_engine *engine, ssize_t transfer_result)
@@ -2023,13 +2036,13 @@ static ssize_t xdma_finalise_transfer(struct xdma_engine *engine, ssize_t transf
 	else/* timeout or signal*/
 	{
 		
-		u32 completed_descriptors=ioread32( &(engine->regs->completed_desc_count));
+		u64 data_count=get_data_count(engine);
 		xdma_engine_stop(engine);
-		dbg_tfr("%u descriptors were completed on engine %s\n", completed_descriptors, engine->name);
+		dbg_tfr("data count is %llu on engine %s\n", data_count, engine->name);
 		if(transfer_result==0)
 		{
 			pr_warn("Transfer on engine %s has timed out.\n", engine->name);
-			if(completed_descriptors==0)
+			if(data_count==0)
 			{
 				transfer_result=-ETIMEDOUT;
 				goto exit;
@@ -2038,15 +2051,15 @@ static ssize_t xdma_finalise_transfer(struct xdma_engine *engine, ssize_t transf
 		else/*transfer result < 0: signal was recieved*/
 		{
 			pr_warn("Transfer on engine %s has been interrupted by a signal.\n", engine->name);
-			if(completed_descriptors==0)
+			if(data_count==0)
 			{
 				 transfer_result=-EINTR;
 				 goto exit;
 			}
 		}
 		
-		/*calculate and return total length of completed descriptors*/ 
-		transfer_result=calculate_completed_length(engine, completed_descriptors);
+		/*calculate total transfered data from data count*/ 
+		transfer_result=data_count * engine->xdev->datapath_width;
 	}
 	
 	exit:
@@ -2059,13 +2072,13 @@ static void xdma_cleanup_transfer(struct xdma_engine *engine, bool transfer_ok)
 {
 	struct xdma_transfer *transfer=&(engine->transfer);
 	dbg_tfr("Cleanup flags: %x\n", transfer->cleanup_flags);
-	
+		
 	if(transfer->cleanup_flags & XFER_FLAG_DESC_DMA_ALLOC)
 	{
 		unsigned int i=0;
 		for(; (i <transfer->num_adj_blocks)&& (transfer->adj_desc_blocks[i].length>0); ++i)
-			dma_pool_free(engine->desc_pool, transfer->adj_desc_blocks[transfer->num_adj_blocks-i-1].virtual_addr,
-					 transfer->adj_desc_blocks[transfer->num_adj_blocks-i-1].dma_addr);
+			dma_pool_free(engine->desc_pool, transfer->adj_desc_blocks[i].virtual_addr,
+					 transfer->adj_desc_blocks[i].dma_addr);
 	}
 	
 	if(transfer->cleanup_flags & XFER_FLAG_DMA_RECORD_ALLOC)
@@ -2519,7 +2532,7 @@ void *xdma_device_open(const char *mname, struct pci_dev *pdev, int *user_max,
 
 	set_max_read_request_size(xdev);
 	set_datapath_width(xdev);
-	dbg_init("XDMA MRRS is %u byte, datapath width is %u bit/%u byte", 
+	dbg_init("XDMA MRRS is %u byte, datapath width is %u bit/%u byte.\n", 
 		xdev->max_read_request_size, xdev->datapath_width*8, xdev->datapath_width);
 	rv = probe_engines(xdev);
 	if (unlikely(rv))
@@ -2581,18 +2594,16 @@ static void wait_for_engines_idle(struct xdma_dev *xdev)
 
 		if (engine->magic == MAGIC_ENGINE) {
 #ifndef XDMA_POLL_MODE   /*marks the completion with UINT_MAX and also ensures that wait queue gets emptied*/
-			if(h2c_timeout_ms==0)
-				complete_all( &(engine->engine_compl));
+			complete_all( &(engine->engine_compl));
 #endif	
 /*polling is perhaps not the best way to wait, however there should be very rarely a need for that.
 It should break immediately in normal operation, therefore acceptable.
-Use a timeout to avoid infinite hang if BUSY_BIT is stuck due to abnormal exit.*/ 
+Use a timeout to avoid infinite hang if BUSY_BIT is stuck due to abnormal exit.*/
 			deadline = jiffies + msecs_to_jiffies(h2c_timeout_ms ? h2c_timeout_ms : 10000);
 			while(test_bit(XENGINE_BUSY_BIT, &(engine->flags))) {
 				if (time_after(jiffies, deadline)) {
 					pr_warn("engine %s: BUSY_BIT stuck, forcing clear\n", engine->name);
-					clear_bit(XENGINE_BUSY_BIT, &(engine->flags));
-					smp_mb__after_atomic();
+					clear_bit_unlock(XENGINE_BUSY_BIT, &(engine->flags));
 					break;
 				}
 				cpu_relax();
@@ -2606,15 +2617,13 @@ Use a timeout to avoid infinite hang if BUSY_BIT is stuck due to abnormal exit.*
 		engine = &xdev->engine_c2h[i];
 		if (engine->magic == MAGIC_ENGINE) {
 #ifndef XDMA_POLL_MODE
-			if(c2h_timeout_ms==0)
-				complete_all( &(engine->engine_compl));
+			complete_all( &(engine->engine_compl));
 #endif	
 			deadline = jiffies + msecs_to_jiffies(c2h_timeout_ms ? c2h_timeout_ms : 10000);
 			while(test_bit(XENGINE_BUSY_BIT, &(engine->flags))) {
 				if (time_after(jiffies, deadline)) {
 					pr_warn("engine %s: BUSY_BIT stuck, forcing clear\n", engine->name);
-					clear_bit(XENGINE_BUSY_BIT, &(engine->flags));
-					smp_mb__after_atomic();
+					clear_bit_unlock(XENGINE_BUSY_BIT, &(engine->flags));
 					break;
 				}
 				cpu_relax();

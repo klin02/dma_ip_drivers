@@ -144,9 +144,11 @@
 #define XDMA_DESC_COMPLETED	(1U << 1)
 #define XDMA_DESC_EOP		(1U << 4)
 
-#define XDMA_PERF_RUN	(1U << 0)
+/* Performance Monitor Control (0xC0) bits, see PG195:
+   Auto = bit 0, Clear = bit 1, Run = bit 2 */
+#define XDMA_PERF_AUTO	(1U << 0)
 #define XDMA_PERF_CLEAR	(1U << 1)
-#define XDMA_PERF_AUTO	(1U << 2)
+#define XDMA_PERF_RUN	(1U << 2)
 #define XDMA_PERF_COUNT_OVERFLOW (1U<<16)
 
 #define MAGIC_ENGINE	0xEEEEEEEEU
@@ -172,6 +174,12 @@
 #define DESC_MAGIC 0xAD4B0000U
 #define DESC_ADJ_SHIFT 8
 #define DESC_ADJ_MASK (0x3FU<<DESC_ADJ_SHIFT)
+/*
+ * PG195 ("Descriptors"): at most 64 descriptors in a single block of
+ * adjacent descriptors; both the descriptor Nxt_adj field and the SGDMA
+ * Descriptor Adjacent register are only 6 bits wide.
+ */
+#define XDMA_MAX_ADJ_BLOCK_LEN 64U
 
 #define C2H_WB 0x52B4U
 
@@ -362,11 +370,31 @@ struct interrupt_regs {
 	u32 channel_msi_vector[8];
 } __packed;
 
+/*
+ * SGDMA Common registers, config BAR target 0x6 (PG195, "SGDMA Common
+ * Registers (0x6)").
+ *
+ * Beware of two similar-looking register groups that must not be confused:
+ *   0x10/0x14/0x18: Descriptor Control (RW/W1S/W1C) -- dsc_halt bits;
+ *                   setting a bit halts descriptor fetching for a channel
+ *                   (H2C in [3:0], C2H in [19:16]).
+ *   0x20/0x24/0x28: Descriptor Credit Mode Enable (RW/W1S/W1C) -- enables
+ *                   descriptor crediting for a channel
+ *                   (H2C in [3:0], C2H in [19:16]).
+ *
+ * Credit-mode enable is at 0x20, NOT 0x10: writing the channel bit at 0x10
+ * halts the channel instead of enabling crediting.
+ */
 struct sgdma_common_regs {
-	u32 padding[8];
-	u32 credit_mode_enable;
-	u32 credit_mode_enable_w1s;
-	u32 credit_mode_enable_w1c;
+	u32 identifier;			/* 0x00 */
+	u32 reserved_1[3];		/* 0x04..0x0C */
+	u32 dsc_control;		/* 0x10 */
+	u32 dsc_control_w1s;		/* 0x14 */
+	u32 dsc_control_w1c;		/* 0x18 */
+	u32 reserved_2;			/* 0x1C */
+	u32 credit_mode_enable;		/* 0x20 */
+	u32 credit_mode_enable_w1s;	/* 0x24 */
+	u32 credit_mode_enable_w1c;	/* 0x28 */
 } __packed;
 
 
@@ -442,6 +470,7 @@ struct xdma_transfer {
 	struct sg_table sgt;
 	generic_dma_record(struct xdma_desc) *adj_desc_blocks;/*bookkeeping for descriptors grouped in adjacent blocks*/
 	unsigned int num_adj_blocks;
+	unsigned int total_descriptors;
 	unsigned int cleanup_flags;/*track initialisation stages of a transfer for cleanup*/
 };
 
@@ -477,7 +506,6 @@ struct xdma_engine {
 	const u8 filler2:1;
 
 	const unsigned int adj_block_len;	/* max length of adjacent block of descriptors */
-	const unsigned desc_max;		/* max # descriptors per xfer */
 	struct xdma_transfer_params transfer_params;
 	struct xdma_transfer transfer;
 	struct xdma_c2h_fifo *fifo;
@@ -573,7 +601,6 @@ ssize_t xdma_fifo_read(struct xdma_engine *engine, char __user *buf,
 		       size_t count, bool nonblock);
 int xdma_fifo_close(struct xdma_engine *engine);
 struct xdma_transfer *engine_cyclic_stop(struct xdma_engine *engine);
-void enable_perf(struct xdma_engine *engine, bool enable);
 int get_perf_stats(struct xdma_engine *engine, struct xdma_performance_ioctl *__user user_perf_res);
 
 void engine_addrmode_set(struct xdma_engine *engine, bool set);
